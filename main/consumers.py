@@ -1,45 +1,48 @@
 import json
-from channels.generic.websocket import WebsocketConsumer
+from channels.generic.websocket import WebsocketConsumer, AsyncWebsocketConsumer
 from django.core.exceptions import ObjectDoesNotExist
+
+from asgiref.sync import sync_to_async
 
 from .models import Account
 from .bitmex import BitmexWS
 
 
-class Consumer(WebsocketConsumer):
+class Consumer(AsyncWebsocketConsumer):
     bitmex_wss: dict
 
-    def connect(self):
-        self.accept()
+    async def websocket_connect(self, message):
+        await self.accept()
         self.bitmex_wss = {}
 
-    def receive(self, text_data=None, bytes_data=None):
-        data = json.loads(text_data)
+    async def websocket_receive(self, message):
+        data = json.loads(message['text'])
 
         if data.get('action') == 'subscribe':
             if self.bitmex_wss.get(data.get('account')) and data.get('symbol') == self.bitmex_wss[data['account']].symbol:
-                return self._send({"status": "OK"})
+                await self._send({"status": "OK"})
             else:
                 if self.bitmex_wss.get(data.get('account')):
-                    self.unsubscribe(data)
-                return self.subscribe(data)
+                    await self.unsubscribe(data)
+                await self.subscribe(data)
         elif data.get('action') == "unsubscribe":
             if not self.bitmex_wss.get(data.get('account')):
-                self._send({"status": "OK"})
+                await self._send({"status": "OK"})
             else:
-                return self.unsubscribe(data)
+                await self.unsubscribe(data)
+        else:
+            await self.send(text_data=json.dumps({
+                "status": "Error",
+                "message": "Invalid command"
+            }))
 
-        self.send(text_data=json.dumps({
-            "status": "Error",
-            "message": "Invalid command"
-        }))
+    async def _send(self, data):
+        print(data, dir(data))
+        await self.send(text_data=json.dumps(data))
 
-    def _send(self, data):
-        return self.send(text_data=json.dumps(data))
-
-    def subscribe(self, data):
+    async  def subscribe(self, data):
         try:
-            account = Account.objects.get(name=data['account'])
+            account = await sync_to_async(lambda: Account.objects.get(name=data['account']), thread_sensitive=False)()
             self.bitmex_wss[account.name] = BitmexWS(
                 self,
                 account.name,
@@ -48,30 +51,31 @@ class Consumer(WebsocketConsumer):
                 api_key=account.api_key,
                 api_secret=account.api_secret,
             )
-            self._send({
+            await self.bitmex_wss[account.name].watch()
+            await self._send({
                 "status": "OKay"
             })
         except ObjectDoesNotExist:
-            self._send({
+            await self._send({
                 "status": "Error",
                 "message": "Account not found"
             })
 
-    def unsubscribe(self, data):
+    async def unsubscribe(self, data):
         try:
-            account = Account.objects.get(name=data['account'])
-            self.bitmex_wss[account.name].close()
+            account = await sync_to_async(lambda: Account.objects.get(name=data['account']))()
+            await self.bitmex_wss[account.name].close()
             del self.bitmex_wss[account.name]
-            self._send({
+            await self._send({
                 "status": "OK",
             })
         except ObjectDoesNotExist:
-            self._send({
+            await self._send({
                 "status": "Error",
                 "message": "Account not found"
             })
 
-    def disconnect(self, code):
+    async def websocket_disconnect(self, message):
         for k in self.bitmex_wss:
-            self.bitmex_wss[k].close()
+            await self.bitmex_wss[k].close()
         self.bitmex_wss = {}
